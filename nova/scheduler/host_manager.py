@@ -538,10 +538,15 @@ class HostManager(object):
             service = service_refs.get(compute.host)
 
             if not service:
-                LOG.warning(_LW(
-                    "No compute service record found for host %(host)s"),
-                    {'host': compute.host})
-                continue
+                service = objects.Service.get_by_host_and_binary(
+                    context, compute.host, 'nova-compute')
+                if not service:
+                    LOG.warning(_LW(
+                        "No compute service record found for host %(host)s"),
+                        {'host': compute.host})
+                    continue
+                else:
+                    LOG.debug("Adding disabled host '%s' to host_state_map"%compute.host)
             host = compute.host
             node = compute.hypervisor_hostname
             state_key = (host, node)
