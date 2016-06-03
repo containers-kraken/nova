@@ -59,7 +59,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
                                            subnets=[subnet_bridge_4,
                                                     subnet_bridge_6],
                                            bridge_interface='eth0',
-                                           vlan=99)
+                                           vlan=99, mtu=9000)
 
     vif_bridge = network_model.VIF(id='vif-xxx-yyy-zzz',
                                    address='ca:fe:de:ad:be:ef',
@@ -89,7 +89,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
                                         subnets=[subnet_bridge_4,
                                                  subnet_bridge_6],
                                         bridge_interface=None,
-                                        vlan=99)
+                                        vlan=99, mtu=1000)
 
     network_ivs = network_model.Network(id='network-id-xxx-yyy-zzz',
                                         bridge='br0',
@@ -312,7 +312,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
                          network_model.VIF_DETAILS_VHOSTUSER_SOCKET:
                                                      '/tmp/usv-xxx-yyy-zzz',
                          network_model.VIF_DETAILS_VHOSTUSER_OVS_PLUG: True},
-              ovs_interfaceid='aaa-bbb-ccc'
+              ovs_interfaceid='aaa-bbb-ccc', mtu=1500
               )
 
     vif_vhostuser_no_path = network_model.VIF(id='vif-xxx-yyy-zzz',
@@ -665,7 +665,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
             'device_exists': [mock.call('qbrvif-xxx-yyy'),
                               mock.call('qvovif-xxx-yyy')],
             '_create_veth_pair': [mock.call('qvbvif-xxx-yyy',
-                                            'qvovif-xxx-yyy')],
+                                            'qvovif-xxx-yyy', 1000)],
             'execute': [mock.call('brctl', 'addbr', 'qbrvif-xxx-yyy',
                                   run_as_root=True),
                         mock.call('brctl', 'setfd', 'qbrvif-xxx-yyy', 0,
@@ -679,7 +679,8 @@ class LibvirtVifTestCase(test.NoDBTestCase):
             'create_ovs_vif_port': [mock.call('br0',
                                               'qvovif-xxx-yyy', 'aaa-bbb-ccc',
                                               'ca:fe:de:ad:be:ef',
-                                              'instance-uuid')]
+                                              'instance-uuid',
+                                              1000)]
         }
         # The disable_ipv6 call needs to be added in the middle, if required
         if ipv6_exists:
@@ -799,7 +800,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
             'device_exists': [mock.call('qbrvif-xxx-yyy'),
                               mock.call('qvovif-xxx-yyy')],
             '_create_veth_pair': [mock.call('qvbvif-xxx-yyy',
-                                            'qvovif-xxx-yyy')],
+                                            'qvovif-xxx-yyy', None)],
             'execute': [mock.call('brctl', 'addbr', 'qbrvif-xxx-yyy',
                                   run_as_root=True),
                         mock.call('brctl', 'setfd', 'qbrvif-xxx-yyy', 0,
@@ -1311,22 +1312,18 @@ class LibvirtVifTestCase(test.NoDBTestCase):
     def test_vhostuser_ovs_plug(self):
 
         calls = {
-                'create_ovs_vif_port': [mock.call('br0',
-                                                  'usv-xxx-yyy-zzz',
-                                                  'aaa-bbb-ccc',
-                                                  'ca:fe:de:ad:be:ef',
-                                                  'instance-uuid')],
-                 'ovs_set_vhostuser_port_type': [mock.call('usv-xxx-yyy-zzz')]
+            'create_ovs_vif_port': [
+                mock.call(
+                    'br0', 'usv-xxx-yyy-zzz', 'aaa-bbb-ccc',
+                    'ca:fe:de:ad:be:ef', 'instance-uuid', 9000,
+                    interface_type=network_model.OVS_VHOSTUSER_INTERFACE_TYPE
+                )]
         }
-        with contextlib.nested(
-                mock.patch.object(linux_net, 'create_ovs_vif_port'),
-                mock.patch.object(linux_net, 'ovs_set_vhostuser_port_type')
-        ) as (create_ovs_vif_port, ovs_set_vhostuser_port_type):
+        with mock.patch.object(linux_net,
+                               'create_ovs_vif_port') as create_ovs_vif_port:
             d = vif.LibvirtGenericVIFDriver()
             d.plug_vhostuser(self.instance, self.vif_vhostuser_ovs)
             create_ovs_vif_port.assert_has_calls(calls['create_ovs_vif_port'])
-            ovs_set_vhostuser_port_type.assert_has_calls(
-                                        calls['ovs_set_vhostuser_port_type'])
 
     def test_vhostuser_ovs_unplug(self):
         calls = {

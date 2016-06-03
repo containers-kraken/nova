@@ -1038,8 +1038,9 @@ class LibvirtDriver(driver.ComputeDriver):
         # reasonably assumed that no such instances exist in the wild
         # anymore, it should be set back to False (the default) so it will
         # throw errors, like it should.
-        backend.remove_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME,
-                            ignore_errors=True)
+        if backend.check_image_exists():
+            backend.remove_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME,
+                                ignore_errors=True)
 
         if instance.host != CONF.host:
             self._undefine_domain(instance)
@@ -2487,7 +2488,9 @@ class LibvirtDriver(driver.ComputeDriver):
         """
         instance_dir = libvirt_utils.get_instance_path(instance)
         unrescue_xml_path = os.path.join(instance_dir, 'unrescue.xml')
+        xml_path = os.path.join(instance_dir, 'libvirt.xml')
         xml = libvirt_utils.load_file(unrescue_xml_path)
+        libvirt_utils.write_to_file(xml_path, xml)
         guest = self._host.get_guest(instance)
 
         # TODO(sahid): We are converting all calls from a
@@ -3116,7 +3119,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 for hdev in [d for d in guest_config.devices
                     if isinstance(d, vconfig.LibvirtConfigGuestHostdevPCI)]:
                     hdbsf = [hdev.domain, hdev.bus, hdev.slot, hdev.function]
-                    dbsf = pci_utils.parse_address(dev['address'])
+                    dbsf = pci_utils.parse_address(dev.address)
                     if [int(x, 16) for x in hdbsf] ==\
                             [int(x, 16) for x in dbsf]:
                         raise exception.PciDeviceDetachFailed(reason=
@@ -6868,7 +6871,7 @@ class LibvirtDriver(driver.ComputeDriver):
             raise loopingcall.LoopingCallDone()
 
     @staticmethod
-    def _disk_size_from_instance(instance, info):
+    def _disk_size_from_instance(instance, disk_name):
         """Determines the disk size from instance properties
 
         Returns the disk size by using the disk name to determine whether it
@@ -6877,11 +6880,13 @@ class LibvirtDriver(driver.ComputeDriver):
 
         Returns 0 if the disk name not match (disk, disk.local).
         """
-        fname = os.path.basename(info['path'])
-        if fname == 'disk':
+        if disk_name == 'disk':
             size = instance.root_gb
-        elif fname == 'disk.local':
+        elif disk_name == 'disk.local':
             size = instance.ephemeral_gb
+        # N.B. We don't handle ephemeral disks named disk.ephN here,
+        # which is almost certainly a bug. It's not clear what this function
+        # should return if an instance has multiple ephemeral disks.
         else:
             size = 0
         return size * units.Gi
@@ -6944,28 +6949,74 @@ class LibvirtDriver(driver.ComputeDriver):
 
         image_meta = objects.ImageMeta.from_dict(image_meta)
 
-        # resize disks. only "disk" and "disk.local" are necessary.
-        disk_info = jsonutils.loads(disk_info)
-        for info in disk_info:
-            size = self._disk_size_from_instance(instance, info)
-            if resize_instance:
-                image = imgmodel.LocalFileImage(info['path'],
-                                                info['type'])
-                self._disk_resize(image, size)
-            if info['type'] == 'raw' and CONF.use_cow_images:
-                self._disk_raw_to_qcow2(info['path'])
-
-        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
-                                            instance,
-                                            image_meta,
-                                            block_device_info)
-        # assume _create_image do nothing if a target file exists.
-        self._create_image(context, instance, disk_info['mapping'],
+        block_disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+                                                  instance,
+                                                  image_meta,
+                                                  block_device_info)
+        # assume _create_image does nothing if a target file exists.
+        # NOTE: This has the intended side-effect of fetching a missing
+        # backing file.
+        self._create_image(context, instance, block_disk_info['mapping'],
                            network_info=network_info,
                            block_device_info=None, inject_files=False,
                            fallback_from_host=migration.source_compute)
-        xml = self._get_guest_xml(context, instance, network_info, disk_info,
-                                  image_meta,
+
+        # Resize root disk and a single ephemeral disk called disk.local
+        # Also convert raw disks to qcow2 if migrating to host which uses
+        # qcow2 from host which uses raw.
+        # TODO(mbooth): Handle resize of multiple ephemeral disks, and
+        #               ephemeral disks not called disk.local.
+        disk_info = jsonutils.loads(disk_info)
+        for info in disk_info:
+            path = info['path']
+            disk_name = os.path.basename(path)
+
+            size = self._disk_size_from_instance(instance, disk_name)
+            if resize_instance:
+                image = imgmodel.LocalFileImage(path, info['type'])
+                self._disk_resize(image, size)
+
+            # NOTE(mdbooth): The code below looks wrong, but is actually
+            # required to prevent a security hole when migrating from a host
+            # with use_cow_images=False to one with use_cow_images=True.
+            # Imagebackend uses use_cow_images to select between the
+            # atrociously-named-Raw and Qcow2 backends. The Qcow2 backend
+            # writes to disk.info, but does not read it as it assumes qcow2.
+            # Therefore if we don't convert raw to qcow2 here, a raw disk will
+            # be incorrectly assumed to be qcow2, which is a severe security
+            # flaw. The reverse is not true, because the atrociously-named-Raw
+            # backend supports both qcow2 and raw disks, and will choose
+            # appropriately between them as long as disk.info exists and is
+            # correctly populated, which it is because Qcow2 writes to
+            # disk.info.
+            #
+            # In general, we do not yet support format conversion during
+            # migration. For example:
+            #   * Converting from use_cow_images=True to use_cow_images=False
+            #     isn't handled. This isn't a security bug, but is almost
+            #     certainly buggy in other cases, as the 'Raw' backend doesn't
+            #     expect a backing file.
+            #   * Converting to/from lvm and rbd backends is not supported.
+            #
+            # This behaviour is inconsistent, and therefore undesirable for
+            # users. It is tightly-coupled to implementation quirks of 2
+            # out of 5 backends in imagebackend and defends against a severe
+            # security flaw which is not at all obvious without deep analysis,
+            # and is therefore undesirable to developers. We should aim to
+            # remove it. This will not be possible, though, until we can
+            # represent the storage layout of a specific instance
+            # independent of the default configuration of the local compute
+            # host.
+
+            # Config disks are hard-coded to be raw even when
+            # use_cow_images=True (see _get_disk_config_image_type),so don't
+            # need to be converted.
+            if (disk_name != 'disk.config' and
+                        info['type'] == 'raw' and CONF.use_cow_images):
+                self._disk_raw_to_qcow2(info['path'])
+
+        xml = self._get_guest_xml(context, instance, network_info,
+                                  block_disk_info, image_meta,
                                   block_device_info=block_device_info,
                                   write_to_disk=True)
         # NOTE(mriedem): vifs_already_plugged=True here, regardless of whether
@@ -6974,7 +7025,7 @@ class LibvirtDriver(driver.ComputeDriver):
         # L2 agent (or neutron server) so neutron may not know that the VIF was
         # unplugged in the first place and never send an event.
         self._create_domain_and_network(context, xml, instance, network_info,
-                                        disk_info,
+                                        block_disk_info,
                                         block_device_info=block_device_info,
                                         power_on=power_on,
                                         vifs_already_plugged=True)
@@ -7024,14 +7075,15 @@ class LibvirtDriver(driver.ComputeDriver):
         # anymore, the try/except/finally should be removed,
         # and ignore_errors should be set back to False (the default) so
         # that problems throw errors, like they should.
-        try:
-            backend.rollback_to_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME)
-        except exception.SnapshotNotFound:
-            LOG.warning(_LW("Failed to rollback snapshot (%s)"),
-                        libvirt_utils.RESIZE_SNAPSHOT_NAME)
-        finally:
-            backend.remove_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME,
-                                ignore_errors=True)
+        if backend.check_image_exists():
+            try:
+                backend.rollback_to_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME)
+            except exception.SnapshotNotFound:
+                LOG.warning(_LW("Failed to rollback snapshot (%s)"),
+                            libvirt_utils.RESIZE_SNAPSHOT_NAME)
+            finally:
+                backend.remove_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME,
+                                    ignore_errors=True)
 
         disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
                                             instance,
