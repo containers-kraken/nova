@@ -3322,6 +3322,15 @@ class LibvirtDriver(driver.ComputeDriver):
         image = self.image_backend.image(instance,
                                          name,
                                          image_type)
+        if (name == 'disk.config' and image_type == 'rbd' and
+                not image.check_image_exists()):
+            # This is likely an older config drive that has not been migrated
+            # to rbd yet. Try to fall back on 'raw' image type.
+            # TODO(melwitt): Add online migration of some sort so we can
+            # remove this fall back once we know all config drives are in rbd.
+            image = self.image_backend.image(instance, name, 'raw')
+            LOG.debug('Config drive not found in RBD, falling back to the '
+                      'instance directory', instance=instance)
         disk_info = disk_mapping[name]
         return image.libvirt_info(disk_info['bus'],
                                   disk_info['dev'],
@@ -5390,8 +5399,13 @@ class LibvirtDriver(driver.ComputeDriver):
             raise exception.
         """
 
-        # NOTE(berendt): virConnectCompareCPU not working for Xen
-        if CONF.libvirt.virt_type not in ['qemu', 'kvm']:
+        # NOTE(kchamart): Comparing host to guest CPU model for emulated
+        # guests (<domain type='qemu'>) should not matter -- in this
+        # mode (QEMU "TCG") the CPU is fully emulated in software and no
+        # hardware acceleration, like KVM, is involved. So, skip the CPU
+        # compatibility check for the QEMU domain type, and retain it for
+        # KVM guests.
+        if CONF.libvirt.virt_type not in ['kvm']:
             return
 
         if guest_cpu is None:
